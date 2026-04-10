@@ -1,127 +1,169 @@
-# 🌤 WeatherBet — Polymarket Weather Trading Bot
+# SkyMarket
 
-Automated weather market trading bot for Polymarket. Finds mispriced temperature outcomes using real forecast data from multiple sources across 20 cities worldwide.
+Smallest practical path from the original paper weather bot to a restart-safe live Polymarket weather trader.
 
-No SDK. No black box. Pure Python.
+The repo now keeps the existing `bot_v2.py` forecast and signal logic as the strategy baseline, but moves the live path into a tiny package with:
+- typed config loading from `.env` plus optional JSON/YAML
+- Polymarket market discovery and YES-token mapping
+- a real broker adapter using `py-clob-client`
+- SQLite persistence for signals, orders, fills, positions, and reconciliation
+- conservative restart recovery and hard risk controls
+- one live-ready entrypoint
 
----
+## Repo Audit Summary
 
-## Versions
+What already existed:
+- `bot_v2.py` had the useful core: city/station mapping, weather forecast fetching, Polymarket event discovery by slug, bucket parsing, EV/Kelly sizing, and paper-style state handling.
+- `bot_v1.py` was a smaller prototype and not a good live-trading base.
 
-### `bot_v1.py` — Base Bot
-The foundation. Scans 6 US cities, fetches forecasts from NWS using airport station coordinates, finds matching temperature buckets on Polymarket, and enters trades when the market price is below the entry threshold.
+What was missing:
+- no reproducible dependency setup
+- no typed config or `.env` flow
+- no real execution layer
+- no durable state for orders/positions
+- no restart reconciliation
+- no hard live-mode safety gates
 
-No math, no complexity. Just the core logic — good for understanding how the system works.
+What changed:
+- added the `skymarket` package for config, markets, strategy, broker, storage, order management, and the new entrypoint
+- added SQLite-backed persistence
+- added focused tests for config, market mapping, risk checks, persistence, and reconciliation
+- added `.env.example` and a new install/run flow
 
-### `weatherbet.py` — Full Bot (current)
-Everything in v1, plus:
-- **20 cities** across 4 continents (US, Europe, Asia, South America, Oceania)
-- **3 forecast sources** — ECMWF (global), HRRR/GFS (US, hourly), METAR (real-time observations)
-- **Expected Value** — skips trades where the math doesn't work
-- **Kelly Criterion** — sizes positions based on edge strength
-- **Stop-loss + trailing stop** — 20% stop, moves to breakeven at +20%
-- **Slippage filter** — skips markets with spread > $0.03
-- **Self-calibration** — learns forecast accuracy per city over time
-- **Full data storage** — every forecast snapshot, trade, and resolution saved to JSON
+## Package Layout
 
----
+- `skymarket/config.py`: typed config loader and live-mode validation
+- `skymarket/markets.py`: Polymarket event lookup and tradable YES-token mapping
+- `skymarket/strategy.py`: preserved weather forecast and signal logic extracted from `bot_v2.py`
+- `skymarket/broker.py`: paper broker plus live Polymarket broker
+- `skymarket/storage.py`: thin SQLite persistence layer
+- `skymarket/order_manager.py`: reconciliation, risk checks, dedupe, submit, stale cancel
+- `skymarket/main.py`: single runnable bot entrypoint
 
-## How It Works
+## Setup
 
-Polymarket runs markets like "Will the highest temperature in Chicago be between 46–47°F on March 7?" These markets are often mispriced — the forecast says 78% likely but the market is trading at 8 cents.
-
-The bot:
-1. Fetches forecasts from ECMWF and HRRR via Open-Meteo (free, no key required)
-2. Gets real-time observations from METAR airport stations
-3. Finds the matching temperature bucket on Polymarket
-4. Calculates Expected Value — only enters if the math is positive
-5. Sizes the position using fractional Kelly Criterion
-6. Monitors stops every 10 minutes, full scan every hour
-7. Auto-resolves markets by querying Polymarket API directly
-
----
-
-## Why Airport Coordinates Matter
-
-Most bots use city center coordinates. That's wrong.
-
-Every Polymarket weather market resolves on a specific airport station. NYC resolves on LaGuardia (KLGA), Dallas on Love Field (KDAL) — not DFW. The difference between city center and airport can be 3–8°F. On markets with 1–2°F buckets, that's the difference between the right trade and a guaranteed loss.
-
-| City | Station | Airport |
-|------|---------|---------|
-| NYC | KLGA | LaGuardia |
-| Chicago | KORD | O'Hare |
-| Miami | KMIA | Miami Intl |
-| Dallas | KDAL | Love Field |
-| Seattle | KSEA | Sea-Tac |
-| Atlanta | KATL | Hartsfield |
-| London | EGLC | London City |
-| Tokyo | RJTT | Haneda |
-| ... | ... | ... |
-
----
-
-## Installation
 ```bash
-git clone https://github.com/alteregoeth-ai/weatherbot
-cd weatherbot
-pip install requests
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev]'
+cp .env.example .env
 ```
 
-Create `config.json` in the project folder:
-```json
-{
-  "balance": 10000.0,
-  "max_bet": 20.0,
-  "min_ev": 0.05,
-  "max_price": 0.45,
-  "min_volume": 2000,
-  "min_hours": 2.0,
-  "max_hours": 72.0,
-  "kelly_fraction": 0.25,
-  "max_slippage": 0.03,
-  "scan_interval": 3600,
-  "calibration_min": 30,
-  "vc_key": "YOUR_VISUAL_CROSSING_KEY"
-}
+The code still supports `config.json` or YAML configs if you want them, but `.env` is the default and simplest path.
+
+## Config
+
+Important variables:
+
+```dotenv
+MODE=paper
+DRY_RUN=true
+LIVE_TRADING_ENABLED=false
+KILL_SWITCH=false
+
+POLY_PRIVATE_KEY=
+POLY_FUNDER=
+POLY_SIGNATURE_TYPE=0
+
+ALLOWED_CITIES=nyc,chicago,miami,dallas,seattle,atlanta
+
+MAX_ORDER_SIZE=20
+MAX_POSITION_PER_MARKET=20
+MAX_TOTAL_EXPOSURE=100
+MAX_DAILY_LOSS=50
+MIN_EDGE=0.10
+MAX_SPREAD=0.03
+MAX_ENTRY_PRICE=0.45
+
+POLL_INTERVAL_SECONDS=3600
+MONITOR_INTERVAL_SECONDS=600
+STALE_ORDER_SECONDS=300
+DATABASE_PATH=data/skymarket.db
 ```
 
-Get a free Visual Crossing API key at visualcrossing.com — used to fetch actual temperatures after market resolution.
+Live mode fails fast if required wallet settings are missing.
 
----
+Assumptions baked into v1 live mode:
+- only the `YES` side of the matched temperature bucket is traded
+- direct EOA signing is the default path
+- nonzero `POLY_SIGNATURE_TYPE` is supported, and `POLY_FUNDER` becomes required in that case
+- entries use aggressive limit buys at the current best ask
 
 ## Usage
+
+Paper mode, one cycle:
+
 ```bash
-python weatherbet.py           # start the bot — scans every hour
-python weatherbet.py status    # balance and open positions
-python weatherbet.py report    # full breakdown of all resolved markets
+python -m skymarket.main --once
 ```
 
----
+Paper mode, continuous:
 
-## Data Storage
+```bash
+python -m skymarket.main
+```
 
-All data is saved to `data/markets/` — one JSON file per market. Each file contains:
-- Hourly forecast snapshots (ECMWF, HRRR, METAR)
-- Market price history
-- Position details (entry, stop, PnL)
-- Final resolution outcome
+Live mode:
 
-This data is used for self-calibration — the bot learns forecast accuracy per city over time and adjusts position sizing accordingly.
+```bash
+MODE=live \
+DRY_RUN=false \
+LIVE_TRADING_ENABLED=true \
+KILL_SWITCH=false \
+python -m skymarket.main
+```
 
----
+Optional config file:
 
-## APIs Used
+```bash
+python -m skymarket.main --config config.yaml --once
+```
 
-| API | Auth | Purpose |
-|-----|------|---------|
-| Open-Meteo | None | ECMWF + HRRR forecasts |
-| Aviation Weather (METAR) | None | Real-time station observations |
-| Polymarket Gamma | None | Market data |
-| Visual Crossing | Free key | Historical temps for resolution |
+## What The Live Bot Does
 
----
+Each cycle:
+1. loads config and opens the SQLite database
+2. reconciles local state against broker open orders, fills, and positions
+3. discovers weather markets by the existing slug-based path
+4. maps matching buckets to actual tradable YES token ids
+5. generates signals from the preserved forecast/EV/Kelly logic
+6. blocks anything that fails hard risk checks
+7. places orders through the paper broker or Polymarket broker
+8. persists signals, orders, fills, and positions for restart safety
+9. cancels stale unfilled orders conservatively
 
-## Disclaimer
+## Safety Warnings
 
-This is not financial advice. Prediction markets carry real risk. Run the simulation thoroughly before committing real capital.
+- Start in paper mode first.
+- Verify wallet funding and token allowance setup externally before the first live run.
+- Live mode requires both `MODE=live` and `LIVE_TRADING_ENABLED=true`.
+- Keep `KILL_SWITCH=true` until wallet setup and risk limits are confirmed.
+- The first live version focuses on safe entry, persistence, and restart behavior. It does not yet implement advanced live exits or full lifecycle portfolio management.
+
+## Tests
+
+Run:
+
+```bash
+pytest tests
+```
+
+Current focused coverage:
+- config loading and live validation
+- market mapping to tradable YES tokens
+- risk guard behavior
+- SQLite persistence round-trip
+- startup reconciliation basics
+
+## Notes
+
+- `bot_v2.py` remains in the repo as the original reference implementation the new strategy module was extracted from.
+- `config.json` legacy settings still load for backward compatibility where practical.
+- Assumptions that could matter live are kept brief in code comments or this README instead of adding more architecture up front.
+
+## Next Improvements
+
+- add stronger live exit logic for open positions
+- improve reconciliation against broker state for partially filled or externally modified orders
+- add wallet allowance and auth preflight checks before entering the main loop
+- improve size selection using real order book depth instead of only top-of-book prices
